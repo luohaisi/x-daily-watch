@@ -34,7 +34,7 @@
 
 ```bash
 cd ~/.openclaw/workspace/skills
-git clone https://github.com/your-username/x-daily-watch.git
+git clone https://github.com/luohaisi/x-daily-watch.git
 ```
 
 2. **创建数据目录**
