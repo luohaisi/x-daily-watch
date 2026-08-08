@@ -1,263 +1,246 @@
 ---
 name: x-daily-watch
-description: "关注 X (Twitter) 大V，每日自动抓取推送，长文备份到飞书文档。支持对话管理关注列表。触发词：关注、取消关注、查看关注列表、手动抓取推文。"
+description: 追踪一个或多个 X/Twitter 账号，完整获取新帖、回复、长帖、线程、引用、媒体和 X Article，去重后在当前 Agent 或可用通知渠道中交付。使用 RSS 作为主内容源、FxTwitter v2 作为覆盖校验和故障降级。适用于“关注/取消关注 X 账号”“查看关注列表”“抓取最新推文”“每日汇总”“定时追踪”“发送飞书通知”等请求，也适用于 Codex、Claude Code、OpenClaw、WorkBuddy 及其他支持 Agent Skills 或 Markdown 指令的 Agent。
 ---
 
-# X 大V每日追踪 - OpenClaw 操作指南
+# X Daily Watch
 
-## 快速开始
+完整追踪用户指定的 X 账号。优先使用文字说明和 `curl`，不要安装依赖，不要创建飞书长文文档，不要截断正文。
 
-### 用户指令
-用户可通过对话触发以下操作：
+## 安装
 
-| 指令 | 功能 |
-|------|------|
-| `帮我关注 @username` | 添加用户到关注列表 |
-| `帮我关注 @username 别名` | 添加用户并设置别名 |
-| `取消关注 @username` | 移除用户 |
-| `查看关注列表` | 显示所有关注用户 |
-| `手动抓取一次推文` | 立即执行抓取和推送 |
+把整个仓库作为一个 Skill 目录安装；根目录已经包含所需的 `SKILL.md`，不需要 Node.js、Python、`jq` 或包管理器。
 
----
+- Codex：让 `$skill-installer` 从 `https://github.com/VictorAgents/x-daily-watch` 安装，或把目录放入用户的 `.agents/skills/x-daily-watch`。
+- Claude Code：把目录放入 `~/.claude/skills/x-daily-watch`，项目内安装则使用 `.claude/skills/x-daily-watch`。
+- OpenClaw：运行 `openclaw skills install git:VictorAgents/x-daily-watch@main`；需要全局可用时按宿主规则添加 `--global`。
+- WorkBuddy 和其他 Agent：使用其 Skill 导入功能指向仓库根目录；如果没有导入命令，把目录放入该 Agent 的 Skills 根目录，或直接把 `SKILL.md` 作为持久指令加载。
 
-## 技术架构
+安装后立即调用一次 `x-daily-watch` 完成下面的首次运行询问。安装器不能执行交互钩子时，必须在第一次实际运行前完成询问。
 
-### 文件结构
-```
-~/.openclaw/workspace/
-├── skills/x-daily-watch/          # 技能目录
-│   ├── SKILL.md                   # 本文档
-│   └── scripts/                   # 脚本目录
-│       ├── config_manager.py      # 配置管理（自动读取飞书配置）
-│       ├── twitter_client.py      # Twitter API 客户端
-│       ├── feishu_doc.py          # 飞书推送和文档模块
-│       └── fetch_and_push.py      # 主执行脚本
-│
-└── data/x-daily-watch/            # 数据目录（归档管理）
-    ├── config.json                # 关注列表配置
-    ├── history.json               # 历史记录（防重复推送）
-    ├── push_message.md            # 最新推送消息
-    ├── long_articles.md           # 长文备份内容
-    └── stats.json                 # 执行统计
-```
+## 核心约束
 
-### 配置来源
-| 配置项 | 来源 | 说明 |
-|--------|------|------|
-| 关注列表 | `data/x-daily-watch/config.json` | 用户通过对话管理 |
-| 飞书配置 | `~/.openclaw/openclaw.json` | 系统级配置，自动读取 |
-| 用户 ID | `openclaw.json` → `channels.feishu.allowFrom[0]` | 自动提取 |
+- 把 RSS 当作主内容源，把 FxTwitter v2 当作覆盖校验、完整正文补全和故障降级源。
+- 正常运行时先请求 RSS，再请求 v2 校验覆盖范围；合并两个来源，而不是重复输出。
+- 获取所有新增内容，不设置“每个账号最多 N 条”，不按热度丢弃内容。
+- 保留普通帖、回复、长帖、完整线程、引用正文、媒体链接和 Article 正文。
+- 不把 RSS 中以 `…` 结尾的 141 字标题当成完整正文。
+- 不把 `count=100` 当成必定返回 100 条；始终处理 `cursor.bottom` 分页。
+- 不把 `since` 当成结果过滤器；它只用于无更新时的 204 快速判断。按时间戳和推文 ID 在本地筛选。
+- 不创建飞书文档。启用飞书时发送完整消息；超出单条消息限制时分片，绝不截断。
+- 不在仓库、日志或回复中保存或展示访问令牌、机器人密钥和其他凭证。
 
----
+## 首次运行
 
-## 脚本使用方法
+把安装阶段和第一次调用视为同一个初始化过程。宿主支持安装钩子时立即询问；不支持时，在第一次执行本 Skill 前询问。
 
-### 主脚本：fetch_and_push.py
+1. 询问要关注的 X 账号；接受 `@handle`、个人主页 URL 或不带 `@` 的 handle。
+2. 询问首次抓取范围；用户没有指定时采用最近 24 小时，不默认导入整个历史 feed。
+3. 检查当前 Agent 是否具有飞书消息能力。
+   - 有能力时询问：“是否发送飞书通知？”
+   - 用户同意后再询问接收目标，并在再次确认后发送一条测试消息。
+   - 没有能力时说明当前宿主不支持并跳过；不要自行安装飞书 SDK 或读取其他 Agent 的私有配置。
+4. 询问：“是否创建定时任务？”
+   - 用户同意后再询问频率、时间和时区。
+   - 优先使用当前 Agent 的原生自动化或调度功能。
+   - 宿主没有调度能力时，只给出该系统可用的 cron、任务计划程序或等价说明；不要擅自创建后台任务。
+5. 未得到明确同意前，不发送外部消息、不创建定时任务、不执行测试通知。
 
-**位置**: `skills/x-daily-watch/scripts/fetch_and_push.py`
+将非敏感状态保存在当前 Agent 约定的持久化位置，不要写回 Skill 仓库。至少保存：
 
-**执行方式**:
+- 关注账号及可选别名
+- 每个账号最后一次完整成功的 UTC 时间
+- 最近已经交付的推文 ID；设置合理的滚动上限
+- 飞书通知是否启用及接收目标的非敏感标识
+- 定时任务是否启用、频率和时区
+- 初始化是否完成
+
+## 对话操作
+
+识别并执行以下自然语言意图：
+
+- “关注 @handle”：校验 handle 后加入关注列表。
+- “取消关注 @handle”：移除账号，但保留历史去重记录，除非用户明确要求清除。
+- “查看关注列表”：显示账号、别名、最后成功时间和上次运行状态。
+- “抓取一次”“立即更新”：执行一次完整抓取。
+- “开启/关闭飞书通知”：先确认能力和接收目标，再修改设置。
+- “设置/取消定时任务”：通过当前 Agent 的调度能力执行，并报告实际创建或删除的任务。
+
+只接受 1 至 15 位英文字母、数字或下划线组成的 handle。把 URL 和 `@` 前缀规范化后再使用。
+
+## 抓取工作流
+
+### 1. 确定增量边界
+
+对每个账号读取：
+
+- `last_success`：上次该账号所有发现内容都被完整处理后的 UTC 时间。
+- `seen_ids`：已经成功交付的推文 ID。
+
+首次运行使用用户选择的回溯时间。后续运行使用 `last_success`，同时保留少量重叠时间以抵抗缓存和乱序，并依靠 ID 去重。
+
+### 2. 先获取 RSS
+
+使用：
+
 ```bash
-cd ~/.openclaw/workspace/skills/x-daily-watch/scripts
-python3 fetch_and_push.py
+curl --fail-with-body --silent --show-error --location \
+  --max-time 30 --retry 2 \
+  -H "Accept: application/rss+xml" \
+  -A "x-daily-watch/2" \
+  "https://fxtwitter.com/<handle>/feed.xml"
 ```
 
-**执行流程**:
-1. 从 `data/x-daily-watch/config.json` 读取关注列表
-2. 从 `~/.openclaw/openclaw.json` 自动读取飞书配置
-3. 调用 vxtwitter API 获取每个用户的推文详情
-4. 筛选 24 小时内推文，按热度排序
-5. 检测长文（默认 ≥500 字）
-6. 创建飞书文档保存长文
-7. 发送完整消息到飞书
-8. 更新历史记录防止重复推送
+把以下情况判定为 RSS 失败：
 
-**依赖模块**:
-- `config_manager.py` - 配置管理，自动读取飞书配置
-- `twitter_client.py` - Twitter/X API 调用
-- `feishu_doc.py` - 飞书消息和文档操作
+- HTTP 非 2xx、超时或连接失败
+- 响应不是可解析 XML
+- 缺少 `channel` 或有效 `item`
+- 条目缺少可提取的推文 ID
 
----
+从每个 `item` 提取 `link` 或 `guid` 中 `/status/<id>` 的数字 ID、`pubDate`、`title`、`description`、`enclosure` 和媒体信息。解码 HTML 实体并规范化空白，但保留正文内部的换行语义。
 
-## 定时任务配置
+RSS 标题满足以下任一条件时，不得当成完整正文：
 
-### Cron 配置
+- 长度为 141 且以 Unicode `…` 结尾
+- 以 `...` 或其他明显省略标记结尾
+- `description`、卡片或链接显示它是 Article、线程、引用或结构化长内容
+- RSS 条目无法证明正文完整
 
-**位置**: OpenClaw Gateway cron 系统
+### 3. 用 v2 校验覆盖并补全
 
-**配置命令**:
+即使 RSS 成功，也要在完整性模式下请求账号状态接口，以覆盖 RSS 可能缺少的回复、线程、Article 或超出 feed 窗口的内容。RSS 仍先处理；v2 只补充缺失 ID 和更完整的结构化字段。
+
+第一页使用：
+
 ```bash
-# 添加定时任务
-openclaw cron add --name "x-daily-watch-push" \
-  --schedule "55 5 * * *" \
-  --timezone "Asia/Shanghai" \
-  --command "cd ~/.openclaw/workspace/skills/x-daily-watch/scripts && python3 fetch_and_push.py"
+curl --get --fail-with-body --silent --show-error --location \
+  --max-time 30 --retry 2 \
+  -H "Accept: application/json" \
+  -A "x-daily-watch/2" \
+  --data-urlencode "count=100" \
+  --data-urlencode "since=<last_success_epoch_seconds>" \
+  --data-urlencode "with_replies=true" \
+  --data-urlencode "groupthreads=true" \
+  "https://api.fxtwitter.com/2/profile/<handle>/statuses"
 ```
 
-**当前配置**:
-```json
-{
-  "name": "x-daily-watch-push",
-  "schedule": {
-    "kind": "cron",
-    "expr": "55 5 * * *",
-    "tz": "Asia/Shanghai"
-  },
-  "sessionTarget": "isolated",
-  "payload": {
-    "kind": "agentTurn",
-    "message": "执行 x-daily-watch 技能..."
-  }
-}
-```
+没有 `last_success` 时省略 `since` 参数；不要传空字符串或伪造时间戳。
 
-**手动触发测试**:
+不要依赖 `jq`。让当前 Agent 直接读取 JSON。
+
+处理响应：
+
+- `204`：v2 没有检测到晚于 `since` 的内容；仍保留 RSS 发现的有效新条目。
+- `200`：把 `type: status` 直接加入候选；把 `type: thread` 的 `statuses` 按顺序展开。
+- 其他状态、无效 JSON 或错误码：记录 v2 失败，继续评估 RSS 是否足以提供完整内容。
+
+存在下一页时，传响应中的 `cursor.bottom`，不要传整个 `cursor` 对象：
+
 ```bash
-openclaw cron run --id "x-daily-watch-push" --force
+curl --get --fail-with-body --silent --show-error --location \
+  --max-time 30 --retry 2 \
+  -H "Accept: application/json" \
+  -A "x-daily-watch/2" \
+  --data-urlencode "count=100" \
+  --data-urlencode "with_replies=true" \
+  --data-urlencode "groupthreads=true" \
+  --data-urlencode "cursor=<cursor.bottom>" \
+  "https://api.fxtwitter.com/2/profile/<handle>/statuses"
 ```
 
----
+继续分页，直到满足以下任一条件：
 
-## 飞书配置要求
+- 已覆盖到 `last_success` 之前且本页没有新的未见 ID
+- `cursor.bottom` 为空
+- 服务明确返回无内容
 
-### 必需权限
+设置防失控页数保护。触发保护时报告账号抓取未完成，不要静默丢弃内容，也不要推进 `last_success`。
 
-在 [飞书开放平台](https://open.feishu.cn/app/) 配置以下权限：
+### 4. 单条补全
 
-| 权限 | 用途 |
-|------|------|
-| `docx:document` | 读取文档 |
-| `docx:document:create` | 创建文档 |
-| `im:message` | 发送消息 |
+对 RSS 中被截断、结构不明确或没有在账号 v2 页面中得到完整字段的 ID，请求：
 
-### 配置文件格式
-
-**~/.openclaw/openclaw.json**:
-```json
-{
-  "channels": {
-    "feishu": {
-      "enabled": true,
-      "appId": "cli_xxx",
-      "appSecret": "xxx",
-      "dmPolicy": "allowlist",
-      "allowFrom": ["ou_用户ID"]
-    }
-  }
-}
-```
-
-脚本会自动从此文件读取：
-- `appId` → 飞书应用 ID
-- `appSecret` → 飞书应用密钥
-- `allowFrom[0]` → 接收消息的用户 ID
-
-### 权限测试
-
-**测试文件位置**: `skills/x-daily-watch/scripts/feishu_doc.py`
-
-**测试方法**:
 ```bash
-cd ~/.openclaw/workspace/skills/x-daily-watch/scripts
-python3 feishu_doc.py
+curl --fail-with-body --silent --show-error --location \
+  --max-time 30 --retry 2 \
+  -H "Accept: application/json" \
+  -A "x-daily-watch/2" \
+  "https://api.fxtwitter.com/2/status/<status_id>"
 ```
 
-**预期输出**:
-```
-测试飞书模块...
-飞书配置: {'app_id': 'cli_xxx', 'app_secret': 'xxx', 'user_id': 'ou_xxx'}
-✅ Token 获取成功: t-g10441dO3GEC...
-```
+按以下优先级构造完整内容：
 
----
+1. Article：递归检查当前 `status`、`status.quote`、线程中的每个 status 及其 quote。Article 可能位于 `status.article`，也可能位于 `status.quote.article`。找到后读取 `article.title`，再按原顺序处理 `article.content.blocks` 中所有带 `text` 的块；保留标题、段落、列表、引用、媒体实体和块顺序，不要只读取顶层 `status.article`。
+2. 长帖或普通帖：读取 `status.raw_text.text`，缺失时回退到 `status.text`。
+3. 引用：附上完整引用正文、作者和原始链接，不只保留当前帖中的引文。
+4. 媒体：保留图片、视频或 GIF 的 URL、类型和可用替代文本。
+5. 线程：优先使用详情响应中的线程；不完整时请求 `https://api.fxtwitter.com/2/thread/<status_id>`。把响应的根 `status` 与 `thread[]` 合并，按 `created_timestamp` 排序，只保留该作者在目标会话中的有序内容；不要假设线程一定嵌套在 `thread.statuses`。
 
-## 配置文件说明
+单条补全失败时，把该 ID 留在待重试集合中。不要发送截断正文，不要把它加入 `seen_ids`。
 
-### config.json
+### 5. 合并两个来源
 
-**位置**: `~/.openclaw/workspace/data/x-daily-watch/config.json`
+使用推文数字 ID 作为唯一主键：
 
-```json
-{
-  "users": [
-    {
-      "username": "LufzzLiz",
-      "alias": "岚叔",
-      "added_at": "2026-04-01",
-      "max_tweets": 5
-    }
-  ],
-  "backup_config": {
-    "enabled": true,
-    "min_length": 500
-  }
-}
-```
+- 两个来源都有同一 ID：只输出一次。
+- RSS 正文明显完整且与 v2 一致：正文来源记为 RSS，v2 只补元数据。
+- v2 提供更长正文、Article、线程、引用或媒体结构：采用 v2 的完整版本。
+- 只有 RSS：只在正文可确认完整时交付；否则执行单条补全。
+- 只有 v2：按完整 v2 内容交付，通常是回复、线程成员或 RSS 窗口外内容。
+- 两边内容冲突：选择信息更完整的版本并记录诊断，不要拼接成重复正文。
 
-| 字段 | 说明 | 默认值 |
-|------|------|--------|
-| `users[].username` | X 用户名 | 必填 |
-| `users[].alias` | 显示别名 | username |
-| `users[].max_tweets` | 每用户最多推送条数 | 5 |
-| `backup_config.min_length` | 长文字数阈值 | 500 |
+为每条结果保留 `status_id`、作者、发布时间、原始链接、内容类型、正文来源和补全来源。
 
-**注意**: 飞书配置不需要在此文件配置，自动从 `~/.openclaw/openclaw.json` 读取。
+### 6. 本地筛选和排序
 
----
+- 使用 `created_timestamp` 或解析后的 `pubDate` 做 UTC 比较。
+- 只交付晚于增量边界且不在 `seen_ids` 的内容。
+- 不要因为 `since` 出现在请求里就跳过本地过滤；响应可能仍包含更早内容。
+- 按发布时间升序交付，使线程和每日汇总可连续阅读。
+- 不按点赞数、转发数或热度删除内容。
 
-## 故障排查
+## 交付完整正文
 
-### 问题 1: 飞书配置未找到
+默认在当前对话返回完整内容。用户启用通知时，再使用当前 Agent 已有的通知能力。
 
-**错误信息**: `飞书配置未找到，请在 ~/.openclaw/openclaw.json 配置 channels.feishu`
+每条内容至少包含：
 
-**解决方案**:
-1. 检查 `~/.openclaw/openclaw.json` 是否存在
-2. 确认 `channels.feishu.enabled = true`
-3. 确认 `appId` 和 `appSecret` 已配置
+- 作者和 `@handle`
+- 完整发布时间
+- 完整正文
+- 完整引用或线程上下文
+- 媒体链接和可用替代文本
+- 原始 X 链接
+- `RSS`、`FxTwitter v2` 或二者合并的来源说明
 
-### 问题 2: 飞书文档无法访问
+遇到平台消息长度限制时：
 
-**原因**: 文档创建后未授权给用户
+- 优先按推文边界拆成多条消息。
+- 单篇 Article 仍过长时按标题和段落拆分，标注“第 n/m 部分”。
+- 发送全部分片后才把该 ID 标记为成功。
+- 不使用 `[:N]`、`...` 或“阅读全文”链接代替正文。
+- 不创建飞书长文文档。
 
-**解决方案**:
-1. 在飞书开放平台添加 `drive:drive` 权限
-2. 或手动分享文档给用户
+## 成功、降级与检查点
 
-### 问题 3: 推文获取失败
+- RSS 成功、v2 失败：交付 RSS 中能够确认完整的内容；保留无法补全的 ID，并报告降级状态。
+- RSS 失败、v2 成功：使用 v2 完成该账号本轮内容。
+- 两者成功：合并、去重并以完整版本为准。
+- 两者失败：报告该账号失败，不更新任何成功检查点。
+- 某条消息或分片发送失败：不要把该 ID 标为已交付。
+- 只有当该账号本轮发现的所有 ID 都被完整处理或明确仍在待重试集合中时，才更新逐条状态；只有全部成功时才推进账号的 `last_success`。
 
-**可能原因**:
-- vxtwitter API 限流（请求间隔已设为 1.5 秒）
-- 用户名不存在或账号被封
-- 网络问题
+RSS 与 v2 都由 FxTwitter 提供，只能形成接口级冗余。不要声称它们能抵抗 FxTwitter 整体不可用。用户需要供应商级冗余时，建议另行配置官方 X API，并明确其凭证、费用和速率限制。
 
-**排查**:
-```bash
-# 测试 API
-curl "https://api.vxtwitter.com/elonmusk"
-curl "https://fxtwitter.com/elonmusk/feed.xml"
-```
+## 运行后报告
 
----
+简洁报告：
 
-## 数据文件说明
+- 每个账号由 RSS、v2 或二者合并发现的数量
+- 新增、重复、补全、失败和待重试数量
+- 是否发生分页、降级或内容冲突
+- 通知是否发送完整、定时任务的实际状态
+- 每个账号是否推进 `last_success`
 
-| 文件 | 说明 |
-|------|------|
-| `config.json` | 关注列表配置 |
-| `history.json` | 已推送推文 ID，防止重复 |
-| `push_message.md` | 最新推送消息内容 |
-| `long_articles.md` | 长文备份内容 |
-| `stats.json` | 执行统计信息 |
-
----
-
-## 更新日志
-
-### v1.0.0 (2026-04-01)
-- 初始版本
-- 支持关注管理（对话添加/移除）
-- 每日自动推送（5:55 AM）
-- 长文备份到飞书文档
-- 飞书配置自动从系统读取
-- 数据文件归档到统一目录
+不要把“命令退出码为 0”单独当成成功证据；以完整内容、去重结果、交付状态和检查点为准。
