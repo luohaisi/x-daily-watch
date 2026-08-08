@@ -1,6 +1,6 @@
 ---
 name: x-daily-watch
-description: 追踪一个或多个 X/Twitter 账号，完整获取新帖、回复、长帖、线程、引用、媒体和 X Article，去重后在当前 Agent 或可用通知渠道中交付。使用 RSS 作为主内容源、FxTwitter v2 作为覆盖校验和故障降级。适用于“关注/取消关注 X 账号”“查看关注列表”“抓取最新推文”“每日汇总”“定时追踪”“发送飞书通知”等请求，也适用于 Codex、Claude Code、OpenClaw、WorkBuddy 及其他支持 Agent Skills 或 Markdown 指令的 Agent。
+description: 追踪一个或多个 X/Twitter 账号，支持从 @handle、主页 URL 或任意公开帖子链接识别并关注作者，完整获取新帖、回复、长帖、线程、引用、媒体和 X Article，去重后在当前 Agent 或可用通知渠道中交付。使用 RSS 作为主内容源、FxTwitter v2 作为覆盖校验和故障降级。适用于“关注/取消关注 X 账号”“粘贴帖子链接新增关注”“查看关注列表”“抓取最新推文”“每日汇总”“定时追踪”“发送飞书通知”等请求，也适用于 Codex、Claude Code、OpenClaw、WorkBuddy 及其他支持 Agent Skills 或 Markdown 指令的 Agent。
 ---
 
 # X Daily Watch
@@ -34,7 +34,7 @@ description: 追踪一个或多个 X/Twitter 账号，完整获取新帖、回�
 
 把安装阶段和第一次调用视为同一个初始化过程。宿主支持安装钩子时立即询问；不支持时，在第一次执行本 Skill 前询问。
 
-1. 询问要关注的 X 账号；接受 `@handle`、个人主页 URL 或不带 `@` 的 handle。
+1. 询问要关注的 X 账号；接受 `@handle`、个人主页 URL、不带 `@` 的 handle 或该账号任意一篇公开帖子的 URL。用户不知道 handle 时主动提示：“复制该账号任意一篇公开 X 帖子的链接发给我即可识别作者。”按“通过帖子链接识别账号”完成核验后再加入关注列表。
 2. 询问首次抓取范围；用户没有指定时采用最近 24 小时，不默认导入整个历史 feed。
 3. 检查当前 Agent 是否具有飞书消息能力。
    - 有能力时询问：“是否发送飞书通知？”
@@ -48,7 +48,8 @@ description: 追踪一个或多个 X/Twitter 账号，完整获取新帖、回�
 
 将非敏感状态保存在当前 Agent 约定的持久化位置，不要写回 Skill 仓库。至少保存：
 
-- 关注账号及可选别名
+- 关注账号的当前 handle、显示名称和可选别名
+- 可获取时保存账号的稳定数字用户 ID，用于识别 handle 改名或被他人重新注册
 - 每个账号最后一次完整成功的 UTC 时间
 - 最近已经交付的推文 ID；设置合理的滚动上限
 - 飞书通知是否启用及接收目标的非敏感标识
@@ -60,13 +61,40 @@ description: 追踪一个或多个 X/Twitter 账号，完整获取新帖、回�
 识别并执行以下自然语言意图：
 
 - “关注 @handle”：校验 handle 后加入关注列表。
+- “关注这篇帖子的作者：<帖子 URL>”：从 URL 和帖子详情识别作者，展示“显示名称（@handle）”并在确认后加入。
+- “我不知道账号 ID/用户名”：提醒用户复制该账号任意一篇公开帖子的链接。
 - “取消关注 @handle”：移除账号，但保留历史去重记录，除非用户明确要求清除。
 - “查看关注列表”：显示账号、别名、最后成功时间和上次运行状态。
 - “抓取一次”“立即更新”：执行一次完整抓取。
 - “开启/关闭飞书通知”：先确认能力和接收目标，再修改设置。
 - “设置/取消定时任务”：通过当前 Agent 的调度能力执行，并报告实际创建或删除的任务。
 
-只接受 1 至 15 位英文字母、数字或下划线组成的 handle。把 URL 和 `@` 前缀规范化后再使用。
+只接受 1 至 15 位英文字母、数字或下划线组成的 handle。把 URL 和 `@` 前缀规范化后再使用；handle 比较和去重不区分大小写，保存接口返回的当前拼写。
+
+### 通过帖子链接识别账号
+
+不要把可重复、可随时修改的显示名称当作账号标识。X 上的 `Elon Musk` 是显示名称，`@elonmusk` 才是用于抓取的 handle；接口中的数字用户 ID 用于校验账号身份连续性。
+
+接受 `x.com`、`twitter.com` 的常见 `www`/`mobile` 子域和 `fxtwitter.com` 的公开帖子链接。忽略查询参数和片段，从路径中的 `/status/<数字 ID>` 提取 2 至 20 位帖子 ID。普通链接形如 `/<handle>/status/<id>`，可把第一段作为候选 handle；`/i/status/<id>` 或其他不含 handle 的链接必须通过帖子详情确定作者，绝不能把 `i` 当作账号。输入 `t.co` 短链接时先跟随重定向，只有最终主机属于上述允许列表且路径包含帖子 ID 时才继续。
+
+使用帖子 ID 请求详情：
+
+```bash
+curl --fail-with-body --silent --show-error --location \
+  --max-time 30 --retry 2 \
+  -H "Accept: application/json" \
+  -A "x-daily-watch/2" \
+  "https://api.fxtwitter.com/2/status/<status_id>"
+```
+
+按以下规则处理：
+
+1. 要求 HTTP 成功、JSON 中 `code` 为 `200`，且 `status.id` 与 URL 的帖子 ID 相同。
+2. 优先读取 `status.author.screen_name`、`status.author.name` 和 `status.author.id`；仅在 `status.author` 缺失时回退到顶层 `author`。不要误用 `status.quote.author`、`replying_to` 或 `reposted_by`。
+3. URL 中的候选 handle 与详情作者一致时，向用户确认：“识别到 Elon Musk（@elonmusk），是否加入关注？”确认后才保存。
+4. 两者不一致时同时展示候选账号和详情作者，不要静默选择。若 `reposted_by.screen_name` 与候选账号相同，询问用户要关注转发者还是原作者；其他冲突也必须确认。
+5. 详情请求失败时，普通 `/<handle>/status/<id>` 链接只能给出“未验证的候选 handle”并请求确认；`/i/status/<id>` 等无 handle 链接无法安全识别，要求用户换一条公开帖子或直接提供 `@handle`。
+6. 写入关注列表前按 handle 不区分大小写去重。若已保存数字用户 ID，以数字 ID 作为账号身份校验键；同一数字 ID 返回新 handle 时更新 handle，同一 handle 返回不同数字 ID 时暂停抓取并询问用户，防止改名后关注到另一个账号。
 
 ## 抓取工作流
 
